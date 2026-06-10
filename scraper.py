@@ -97,9 +97,21 @@ def apply_range(
     return videos
 
 
+def _make_api(cookies: str | None) -> YouTubeTranscriptApi:
+    if not cookies:
+        return YouTubeTranscriptApi()
+    import requests
+    from http.cookiejar import MozillaCookieJar
+    session = requests.Session()
+    jar = MozillaCookieJar(cookies)
+    jar.load(ignore_discard=True, ignore_expires=True)
+    session.cookies = jar
+    return YouTubeTranscriptApi(http_client=session)
+
+
 def fetch_transcript(video_id: str, lang: str, allow_auto: bool, cookies: str | None = None):
     """Returns str (text), None (нет субтитров), или _RATE_LIMITED (заблокированы)."""
-    api = YouTubeTranscriptApi(cookies=cookies) if cookies else YouTubeTranscriptApi()
+    api = _make_api(cookies)
     try:
         transcript_list = api.list(video_id)
     except _RATE_LIMIT_ERRORS:
@@ -252,6 +264,8 @@ def main() -> None:
     parser.add_argument("--no-auto", action="store_true", help="Не использовать авто-субтитры")
     parser.add_argument("--overwrite", action="store_true", help="Перезаписывать существующие файлы")
     parser.add_argument("--delay", type=float, default=1.0, metavar="SEC", help="Базовая пауза между запросами (по умолч. 1.0 сек, реальная — случайная ±50%%)")
+    parser.add_argument("--batch-size", type=int, default=25, metavar="N", help="Видео за одну сессию до паузы (по умолч. 25)")
+    parser.add_argument("--batch-pause", type=float, default=600, metavar="SEC", help="Пауза между порциями в секундах (по умолч. 600 = 10 мин)")
     parser.add_argument("--cookies", metavar="FILE", help="Путь к файлу cookies.txt (Netscape формат) для аутентификации")
     parser.add_argument("--cookies-from-browser", metavar="BROWSER", help="Взять cookies из браузера: chrome, firefox, edge")
     parser.add_argument("--output", default="output", metavar="DIR", help="Папка вывода (по умолч. ./output)")
@@ -293,39 +307,54 @@ def main() -> None:
     skipped_exists = 0
 
     offset = (args.from_video - 1) if args.from_video else 0
+    total = len(all_videos)
+    batch_size = args.batch_size
+    batch_pause = args.batch_pause
 
-    for i, video in enumerate(tqdm(all_videos, desc="Транскрипты", unit="vid"), start=1):
-        global_index = offset + i
-        video_id = video["id"]
-        title = video["title"]
+    with tqdm(total=total, desc="Транскрипты", unit="vid") as pbar:
+        for i, video in enumerate(all_videos, start=1):
+            global_index = offset + i
+            video_id = video["id"]
+            title = video["title"]
 
-        time.sleep(_human_delay(args.delay, i))  # человекоподобная пауза
+            # Пауза между порциями
+            if i > 1 and (i - 1) % batch_size == 0:
+                batch_num = (i - 1) // batch_size
+                total_batches = (total + batch_size - 1) // batch_size
+                pause = batch_pause + random.uniform(-30, 30)
+                tqdm.write(
+                    f"\n[batch] Порция {batch_num}/{total_batches} завершена. "
+                    f"Пауза {pause:.0f}с чтобы не словить бан..."
+                )
+                time.sleep(pause)
 
-        result = None
-        for attempt in range(5):
-            result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
-            if result is _RATE_LIMITED:
-                wait = 60 * (2 ** attempt)  # 60с → 120с → 240с → ...
-                tqdm.write(f"[rate limit] YouTube заблокировал запросы. Ждём {wait}с (попытка {attempt+1}/5)...")
-                time.sleep(wait)
+            time.sleep(_human_delay(args.delay, i))
+
+            result = None
+            for attempt in range(5):
+                result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
+                if result is _RATE_LIMITED:
+                    wait = 60 * (2 ** attempt)
+                    tqdm.write(f"[rate limit] Заблокированы. Ждём {wait}с (попытка {attempt+1}/5)...")
+                    time.sleep(wait)
+                    continue
+                break
+
+            if result is _RATE_LIMITED or result is None:
+                reason = "rate limited after retries" if result is _RATE_LIMITED else "no transcript available"
+                tqdm.write(f"[skip] нет транскрипта: {title}")
+                log_skipped(output_root, video_id, title, reason)
+                skipped_no_transcript += 1
+                pbar.update(1)
                 continue
-            break  # None (нет субтитров) или str (успех)
 
-        if result is _RATE_LIMITED or result is None:
-            reason = "rate limited after retries" if result is _RATE_LIMITED else "no transcript available"
-            tqdm.write(f"[skip] нет транскрипта: {title}")
-            log_skipped(output_root, video_id, title, reason)
-            skipped_no_transcript += 1
-            continue
-
-        text = result
-
-        written = save_transcript(text, output_root, global_index, title, args.overwrite)
-        if written:
-            saved += 1
-        else:
-            tqdm.write(f"[skip] уже существует: {global_index:03d} — {sanitize_filename(title)}.txt")
-            skipped_exists += 1
+            written = save_transcript(result, output_root, global_index, title, args.overwrite)
+            if written:
+                saved += 1
+            else:
+                tqdm.write(f"[skip] уже существует: {global_index:03d} — {sanitize_filename(title)}.txt")
+                skipped_exists += 1
+            pbar.update(1)
 
     print(f"\n[done] Сохранено: {saved} | Пропущено (нет субтитров): {skipped_no_transcript} | Уже было: {skipped_exists}")
     print(f"[done] Файлы в: {output_root.resolve()}")
