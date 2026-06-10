@@ -178,16 +178,20 @@ def save_transcript(
     return True
 
 
-def log_skipped(folder: Path, video_id: str, title: str, reason: str) -> None:
+def init_skipped_log(folder: Path) -> None:
+    """Добавляет разделитель нового запуска в skipped.txt."""
     log_path = folder / "skipped.txt"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"# Пропущенные видео — {timestamp}\n"
+    separator = f"\n# === Запуск {timestamp} ===\n"
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(separator)
+
+
+def log_skipped(folder: Path, video_id: str, title: str, reason: str) -> None:
+    log_path = folder / "skipped.txt"
     line = f"{video_id} | {title} | {reason}\n"
-    if not log_path.exists():
-        log_path.write_text(header + line, encoding="utf-8")
-    else:
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(line)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line)
 
 
 def _human_delay(base: float, index: int) -> float:
@@ -301,6 +305,7 @@ def main() -> None:
     channel_name = sanitize_filename(all_videos[0]["channel"]) if all_videos else "Unknown"
     output_root = Path(args.output) / channel_name
     output_root.mkdir(parents=True, exist_ok=True)
+    init_skipped_log(output_root)
 
     saved = 0
     skipped_no_transcript = 0
