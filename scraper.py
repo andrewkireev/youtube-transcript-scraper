@@ -22,20 +22,23 @@ except ImportError as e:
     sys.exit(1)
 
 
-def _normalize_channel_url(url: str) -> str:
-    """Append /videos to channel URLs so yt-dlp returns videos, not tab list."""
-    import re
+def _normalize_channel_url(url: str) -> tuple[str, bool]:
+    """Append /videos to channel URLs so yt-dlp returns videos, not tab list.
+    Returns (normalized_url, is_channel) where is_channel signals to reverse order."""
     # Already pointing at a specific tab or playlist — leave as-is
-    if any(x in url for x in ["/videos", "/shorts", "/live", "/streams", "/playlist?", "watch?v="]):
-        return url
+    if any(x in url for x in ["/shorts", "/live", "/streams", "/playlist?", "watch?v="]):
+        return url, False
+    # /videos tab — it's a channel, reverse order
+    if re.search(r"youtube\.com/(@[^/?]+|channel/[^/?]+|c/[^/?]+|user/[^/?]+)/videos", url):
+        return url, True
     # Channel-style URLs: @handle, /channel/UC..., /c/name, /user/name
     if re.search(r"youtube\.com/(@[^/?]+|channel/[^/?]+|c/[^/?]+|user/[^/?]+)$", url):
-        return url.rstrip("/") + "/videos"
-    return url
+        return url.rstrip("/") + "/videos", True
+    return url, False
 
 
 def get_video_list(url: str) -> list[dict]:
-    url = _normalize_channel_url(url)
+    url, is_channel = _normalize_channel_url(url)
     ydl_opts = {
         "quiet": True,
         "extract_flat": True,
@@ -60,6 +63,9 @@ def get_video_list(url: str) -> list[dict]:
             ch = entry.get("channel") or entry.get("uploader") or channel
             if video_id:
                 videos.append({"id": video_id, "title": title, "channel": ch})
+        # Channel videos come newest-first; reverse so 001 = oldest
+        if is_channel:
+            videos.reverse()
         return videos
     else:
         video_id = info.get("id")
