@@ -15,7 +15,6 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
 try:
     import yt_dlp
     from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
     from tqdm import tqdm
 except ImportError as e:
     print(f"[error] Missing dependency: {e}")
@@ -23,7 +22,20 @@ except ImportError as e:
     sys.exit(1)
 
 
+def _normalize_channel_url(url: str) -> str:
+    """Append /videos to channel URLs so yt-dlp returns videos, not tab list."""
+    import re
+    # Already pointing at a specific tab or playlist — leave as-is
+    if any(x in url for x in ["/videos", "/shorts", "/live", "/streams", "/playlist?", "watch?v="]):
+        return url
+    # Channel-style URLs: @handle, /channel/UC..., /c/name, /user/name
+    if re.search(r"youtube\.com/(@[^/?]+|channel/[^/?]+|c/[^/?]+|user/[^/?]+)$", url):
+        return url.rstrip("/") + "/videos"
+    return url
+
+
 def get_video_list(url: str) -> list[dict]:
+    url = _normalize_channel_url(url)
     ydl_opts = {
         "quiet": True,
         "extract_flat": True,
@@ -73,32 +85,29 @@ def apply_range(
 
 
 def fetch_transcript(video_id: str, lang: str, allow_auto: bool) -> str | None:
+    api = YouTubeTranscriptApi()
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-    except (TranscriptsDisabled, NoTranscriptFound, Exception):
+        transcript_list = api.list(video_id)
+    except Exception:
         return None
 
     preferred = [lang, "en"]
     transcript = None
 
     # Manual transcripts first
-    for code in preferred:
-        try:
-            transcript = transcript_list.find_manually_created_transcript([code])
-            break
-        except Exception:
-            continue
+    try:
+        transcript = transcript_list.find_manually_created_transcript(preferred)
+    except Exception:
+        pass
 
     # Auto-generated fallback
     if transcript is None and allow_auto:
-        for code in preferred:
-            try:
-                transcript = transcript_list.find_generated_transcript([code])
-                break
-            except Exception:
-                continue
+        try:
+            transcript = transcript_list.find_generated_transcript(preferred)
+        except Exception:
+            pass
 
-    # Any available
+    # Any available language
     if transcript is None:
         try:
             all_transcripts = list(transcript_list)
@@ -111,8 +120,12 @@ def fetch_transcript(video_id: str, lang: str, allow_auto: bool) -> str | None:
         return None
 
     try:
-        entries = transcript.fetch()
-        return " ".join(e["text"].strip() for e in entries if e.get("text"))
+        fetched = transcript.fetch()
+        return " ".join(
+            snip.text.strip()
+            for snip in fetched
+            if getattr(snip, "text", None)
+        )
     except Exception:
         return None
 
