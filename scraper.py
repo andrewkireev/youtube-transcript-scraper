@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import re
 import sys
 import time
@@ -177,6 +178,26 @@ def log_skipped(folder: Path, video_id: str, title: str, reason: str) -> None:
             f.write(line)
 
 
+def _human_delay(base: float, index: int) -> float:
+    """Случайная пауза, имитирующая поведение человека.
+
+    - Базовый разброс ±50% от base
+    - Каждые ~10 видео — более длинная пауза (как будто отвлёкся)
+    - Редкие длинные паузы (5% шанс) — «читаю страницу»
+    """
+    delay = random.uniform(base * 0.5, base * 1.5)
+
+    # Каждые ~10 видео — пауза 2–5x длиннее
+    if index % random.randint(8, 12) == 0:
+        delay *= random.uniform(2.0, 5.0)
+
+    # 5% шанс на совсем длинную паузу (как будто переключился на другое)
+    if random.random() < 0.05:
+        delay += random.uniform(5.0, 15.0)
+
+    return delay
+
+
 def _resolve_cookies(args) -> str | None:
     """Возвращает путь к cookies.txt или None."""
     if getattr(args, "cookies", None):
@@ -230,7 +251,7 @@ def main() -> None:
     parser.add_argument("--lang", default="ru", metavar="LANG", help="Предпочитаемый язык (по умолч. ru)")
     parser.add_argument("--no-auto", action="store_true", help="Не использовать авто-субтитры")
     parser.add_argument("--overwrite", action="store_true", help="Перезаписывать существующие файлы")
-    parser.add_argument("--delay", type=float, default=1.0, metavar="SEC", help="Пауза между запросами (по умолч. 1.0 сек)")
+    parser.add_argument("--delay", type=float, default=1.0, metavar="SEC", help="Базовая пауза между запросами (по умолч. 1.0 сек, реальная — случайная ±50%%)")
     parser.add_argument("--cookies", metavar="FILE", help="Путь к файлу cookies.txt (Netscape формат) для аутентификации")
     parser.add_argument("--cookies-from-browser", metavar="BROWSER", help="Взять cookies из браузера: chrome, firefox, edge")
     parser.add_argument("--output", default="output", metavar="DIR", help="Папка вывода (по умолч. ./output)")
@@ -278,7 +299,7 @@ def main() -> None:
         video_id = video["id"]
         title = video["title"]
 
-        time.sleep(args.delay)  # базовая пауза между запросами
+        time.sleep(_human_delay(args.delay, i))  # человекоподобная пауза
 
         result = None
         for attempt in range(5):
