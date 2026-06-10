@@ -37,13 +37,14 @@ def _normalize_channel_url(url: str) -> tuple[str, bool]:
     return url, False
 
 
-def get_video_list(url: str) -> list[dict]:
+def get_video_list(url: str, lang: str = "ru") -> list[dict]:
     url, is_channel = _normalize_channel_url(url)
     ydl_opts = {
         "quiet": True,
         "extract_flat": True,
         "skip_download": True,
         "no_warnings": True,
+        "extractor_args": {"youtube": {"lang": [lang]}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -199,7 +200,7 @@ def main() -> None:
     print(f"[info] Получаю список видео...")
     for url in args.urls:
         try:
-            videos = get_video_list(url)
+            videos = get_video_list(url, lang=args.lang)
             if not videos:
                 print(f"[warn] Видео не найдены для: {url}")
             else:
