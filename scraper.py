@@ -15,11 +15,16 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
 try:
     import yt_dlp
     from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api._errors import RequestBlocked, IpBlocked, YouTubeRequestFailed
     from tqdm import tqdm
 except ImportError as e:
     print(f"[error] Missing dependency: {e}")
     print("Run: pip install yt-dlp youtube-transcript-api tqdm")
     sys.exit(1)
+
+
+_RATE_LIMITED = object()  # sentinel: отличаем rate limit от «нет субтитров»
+_RATE_LIMIT_ERRORS = (RequestBlocked, IpBlocked, YouTubeRequestFailed)
 
 
 def _normalize_channel_url(url: str) -> tuple[str, bool]:
@@ -91,30 +96,30 @@ def apply_range(
     return videos
 
 
-def fetch_transcript(video_id: str, lang: str, allow_auto: bool) -> str | None:
-    api = YouTubeTranscriptApi()
+def fetch_transcript(video_id: str, lang: str, allow_auto: bool, cookies: str | None = None):
+    """Returns str (text), None (нет субтитров), или _RATE_LIMITED (заблокированы)."""
+    api = YouTubeTranscriptApi(cookies=cookies) if cookies else YouTubeTranscriptApi()
     try:
         transcript_list = api.list(video_id)
+    except _RATE_LIMIT_ERRORS:
+        return _RATE_LIMITED
     except Exception:
         return None
 
     preferred = [lang, "en"]
     transcript = None
 
-    # Manual transcripts first
     try:
         transcript = transcript_list.find_manually_created_transcript(preferred)
     except Exception:
         pass
 
-    # Auto-generated fallback
     if transcript is None and allow_auto:
         try:
             transcript = transcript_list.find_generated_transcript(preferred)
         except Exception:
             pass
 
-    # Any available language
     if transcript is None:
         try:
             all_transcripts = list(transcript_list)
@@ -133,6 +138,8 @@ def fetch_transcript(video_id: str, lang: str, allow_auto: bool) -> str | None:
             for snip in fetched
             if getattr(snip, "text", None)
         )
+    except _RATE_LIMIT_ERRORS:
+        return _RATE_LIMITED
     except Exception:
         return None
 
@@ -170,6 +177,39 @@ def log_skipped(folder: Path, video_id: str, title: str, reason: str) -> None:
             f.write(line)
 
 
+def _resolve_cookies(args) -> str | None:
+    """Возвращает путь к cookies.txt или None."""
+    if getattr(args, "cookies", None):
+        p = Path(args.cookies)
+        if not p.exists():
+            print(f"[warn] Файл cookies не найден: {p}")
+            return None
+        print(f"[info] Используем cookies из файла: {p}")
+        return str(p)
+
+    browser = getattr(args, "cookies_from_browser", None)
+    if browser:
+        cookies_path = Path("cookies.txt")
+        print(f"[info] Извлекаем cookies из браузера: {browser}...")
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["yt-dlp", "--cookies-from-browser", browser,
+                 "--cookies", str(cookies_path),
+                 "--flat-playlist", "--skip-download",
+                 "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+                capture_output=True, text=True, timeout=30
+            )
+            if cookies_path.exists() and cookies_path.stat().st_size > 0:
+                print(f"[info] Cookies сохранены в {cookies_path}")
+                return str(cookies_path)
+            else:
+                print(f"[warn] Не удалось извлечь cookies из {browser}")
+        except Exception as e:
+            print(f"[warn] Ошибка при извлечении cookies: {e}")
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Скачивает транскрипты YouTube-видео в текстовые файлы.",
@@ -190,10 +230,16 @@ def main() -> None:
     parser.add_argument("--lang", default="ru", metavar="LANG", help="Предпочитаемый язык (по умолч. ru)")
     parser.add_argument("--no-auto", action="store_true", help="Не использовать авто-субтитры")
     parser.add_argument("--overwrite", action="store_true", help="Перезаписывать существующие файлы")
+    parser.add_argument("--delay", type=float, default=1.0, metavar="SEC", help="Пауза между запросами (по умолч. 1.0 сек)")
+    parser.add_argument("--cookies", metavar="FILE", help="Путь к файлу cookies.txt (Netscape формат) для аутентификации")
+    parser.add_argument("--cookies-from-browser", metavar="BROWSER", help="Взять cookies из браузера: chrome, firefox, edge")
     parser.add_argument("--output", default="output", metavar="DIR", help="Папка вывода (по умолч. ./output)")
 
     args = parser.parse_args()
     allow_auto = not args.no_auto
+
+    # Подготовка cookies
+    cookies_file = _resolve_cookies(args)
 
     all_videos: list[dict] = []
 
@@ -232,18 +278,26 @@ def main() -> None:
         video_id = video["id"]
         title = video["title"]
 
-        for attempt in range(3):
-            text = fetch_transcript(video_id, args.lang, allow_auto)
-            if text is not None:
-                break
-            if attempt < 2:
-                time.sleep(2)
+        time.sleep(args.delay)  # базовая пауза между запросами
 
-        if text is None:
+        result = None
+        for attempt in range(5):
+            result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
+            if result is _RATE_LIMITED:
+                wait = 60 * (2 ** attempt)  # 60с → 120с → 240с → ...
+                tqdm.write(f"[rate limit] YouTube заблокировал запросы. Ждём {wait}с (попытка {attempt+1}/5)...")
+                time.sleep(wait)
+                continue
+            break  # None (нет субтитров) или str (успех)
+
+        if result is _RATE_LIMITED or result is None:
+            reason = "rate limited after retries" if result is _RATE_LIMITED else "no transcript available"
             tqdm.write(f"[skip] нет транскрипта: {title}")
-            log_skipped(output_root, video_id, title, "no transcript available")
+            log_skipped(output_root, video_id, title, reason)
             skipped_no_transcript += 1
             continue
+
+        text = result
 
         written = save_transcript(text, output_root, global_index, title, args.overwrite)
         if written:
