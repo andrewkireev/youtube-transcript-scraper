@@ -220,22 +220,24 @@ def log_skipped(folder: Path, video_id: str, title: str, reason: str) -> None:
         f.write(line)
 
 
-def _human_delay(base: float, index: int) -> float:
-    """Случайная пауза, имитирующая поведение человека.
+def _human_delay(base: float) -> float:
+    """Случайная пауза без предсказуемых паттернов.
 
-    - Базовый разброс ±50% от base
-    - Каждые ~10 видео — более длинная пауза (как будто отвлёкся)
-    - Редкие длинные паузы (5% шанс) — «читаю страницу»
+    Никаких фиксированных периодов (каждые N видео). Только вероятности:
+    - Базовый диапазон: 60–180% от base
+    - 18% шанс — «задумался»: пауза в 1.8–3.5x длиннее
+    - 7% шанс — «отвлёкся»: +10–35 сек сверху
+    - 2% шанс — «пошёл на кухню»: +40–90 сек
     """
-    delay = random.uniform(base * 0.5, base * 1.5)
+    delay = random.uniform(base * 0.6, base * 1.8)
 
-    # Каждые ~10 видео — пауза 2–5x длиннее
-    if index % random.randint(8, 12) == 0:
-        delay *= random.uniform(2.0, 5.0)
-
-    # 5% шанс на совсем длинную паузу (как будто переключился на другое)
-    if random.random() < 0.05:
-        delay += random.uniform(5.0, 15.0)
+    r = random.random()
+    if r < 0.02:
+        delay += random.uniform(40.0, 90.0)   # редкая длинная пауза
+    elif r < 0.09:
+        delay += random.uniform(10.0, 35.0)   # «отвлёкся»
+    elif r < 0.27:
+        delay *= random.uniform(1.8, 3.5)     # «задумался»
 
     return delay
 
@@ -339,10 +341,15 @@ def main() -> None:
 
     offset = (args.from_video - 1) if args.from_video else 0
     total = len(all_videos)
-    batch_size = args.batch_size
     batch_pause = args.batch_pause
 
     api_calls = 0  # считаем только реальные запросы к API (не уже существующие)
+
+    # Первый размер порции — случайный от половины до полутора --batch-size
+    _next_batch_at = random.randint(
+        max(3, args.batch_size // 2),
+        args.batch_size + args.batch_size // 2,
+    )
 
     with tqdm(total=total, desc="Транскрипты", unit="vid") as pbar:
         for i, video in enumerate(all_videos, start=1):
@@ -359,32 +366,33 @@ def main() -> None:
                     pbar.update(1)
                     continue
 
-            # Пауза между порциями — считаем только реальные API-запросы
-            if api_calls > 0 and api_calls % batch_size == 0:
-                batch_num = api_calls // batch_size
-                total_batches = (total + batch_size - 1) // batch_size
-                pause = batch_pause + random.uniform(0, min(30, batch_pause * 0.2))
-                tqdm.write(
-                    f"\n[batch] Порция {batch_num}/{total_batches} завершена. "
-                    f"Пауза {pause:.0f}с чтобы не словить бан..."
-                )
+            # Пауза между порциями — размер порции и длительность паузы каждый раз разные
+            if api_calls > 0 and api_calls >= _next_batch_at:
+                # Пауза: базовая × случайный коэффициент 0.7–1.6
+                pause = batch_pause * random.uniform(0.7, 1.6)
+                tqdm.write(f"\n[batch] {api_calls} запросов сделано. Пауза {pause:.0f}с...")
                 time.sleep(pause)
+                # Следующая порция — снова случайный размер
+                _next_batch_at = api_calls + random.randint(
+                    max(3, args.batch_size // 2),
+                    args.batch_size + args.batch_size // 2,
+                )
 
-            time.sleep(_human_delay(args.delay, i))
+            time.sleep(_human_delay(args.delay))
 
             api_calls += 1
             result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
 
             if result is _RATE_LIMITED:
-                # Одна попытка восстановиться: короткий ретрай через 45 сек
-                tqdm.write(f"[rate limit] Заблокированы на видео {global_index}. Ждём 45с и пробуем ещё раз...")
-                time.sleep(45)
+                # Одна попытка восстановиться: случайная пауза 30–70 сек
+                retry_wait = random.uniform(30, 70)
+                tqdm.write(f"[rate limit] Заблокированы на видео {global_index}. Ждём {retry_wait:.0f}с...")
+                time.sleep(retry_wait)
                 result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
 
                 if result is _RATE_LIMITED:
-                    # Всё равно заблокированы — делаем большую паузу и идём дальше
-                    # Не застреваем на одном видео на 30 минут
-                    extra_pause = batch_pause + random.uniform(30, 90)
+                    # Всё равно заблокированы — случайная большая пауза и идём дальше
+                    extra_pause = batch_pause * random.uniform(1.2, 2.0)
                     tqdm.write(f"[rate limit] Всё ещё заблокированы. Большая пауза {extra_pause:.0f}с, пропускаем видео.")
                     log_skipped(output_root, video_id, title, "rate limited after retries")
                     skipped_no_transcript += 1
