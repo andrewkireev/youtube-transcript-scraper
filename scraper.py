@@ -13,19 +13,19 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import glob
+import tempfile
+
 try:
     import yt_dlp
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import RequestBlocked, IpBlocked, YouTubeRequestFailed
     from tqdm import tqdm
 except ImportError as e:
     print(f"[error] Missing dependency: {e}")
-    print("Run: pip install yt-dlp youtube-transcript-api tqdm")
+    print("Run: pip install yt-dlp tqdm")
     sys.exit(1)
 
 
 _RATE_LIMITED = object()  # sentinel: отличаем rate limit от «нет субтитров»
-_RATE_LIMIT_ERRORS = (RequestBlocked, IpBlocked, YouTubeRequestFailed)
 
 
 def _normalize_channel_url(url: str) -> tuple[str, bool]:
@@ -97,64 +97,90 @@ def apply_range(
     return videos
 
 
-def _make_api(cookies: str | None) -> YouTubeTranscriptApi:
-    if not cookies:
-        return YouTubeTranscriptApi()
-    import requests
-    from http.cookiejar import MozillaCookieJar
-    session = requests.Session()
-    jar = MozillaCookieJar(cookies)
-    jar.load(ignore_discard=True, ignore_expires=True)
-    session.cookies = jar
-    return YouTubeTranscriptApi(http_client=session)
+def _parse_vtt(content: str) -> str:
+    """Конвертирует VTT-субтитры в чистый текст, убирая дубли."""
+    lines = []
+    prev = ""
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Пропускаем заголовки и таймстемпы
+        if (line.startswith("WEBVTT") or line.startswith("NOTE")
+                or line.startswith("Kind:") or line.startswith("Language:")
+                or "-->" in line or line.isdigit()):
+            continue
+        # Убираем HTML-теги (<c>, <00:00:01.280>, <c.color-white> и т.д.)
+        clean = re.sub(r"<[^>]+>", "", line).strip()
+        # Убираем дублирующиеся строки (YouTube auto-subs дублирует каждую фразу)
+        if clean and clean != prev:
+            lines.append(clean)
+            prev = clean
+    return " ".join(lines)
 
 
 def fetch_transcript(video_id: str, lang: str, allow_auto: bool, cookies: str | None = None):
-    """Returns str (text), None (нет субтитров), или _RATE_LIMITED (заблокированы)."""
-    api = _make_api(cookies)
-    try:
-        transcript_list = api.list(video_id)
-    except _RATE_LIMIT_ERRORS:
-        return _RATE_LIMITED
-    except Exception:
-        return None
+    """Скачивает субтитры через yt-dlp.
+    Возвращает str (текст), None (нет субтитров), или _RATE_LIMITED."""
+    # Приоритет языков: запрошенный → ru → en
+    # НЕ используем "all" — это вызывает загрузку всех языковых дорожек подряд без пауз
+    langs = []
+    if lang not in langs:
+        langs.append(lang)
+    if "ru" not in langs:
+        langs.append("ru")
+    if "en" not in langs:
+        langs.append("en")
 
-    preferred = [lang, "en"]
-    transcript = None
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "writesubtitles": True,
+            "writeautomaticsub": allow_auto,
+            "subtitleslangs": langs,
+            "subtitlesformat": "vtt",
+            "skip_download": True,
+            "outtmpl": os.path.join(tmpdir, "%(id)s"),
+            "retries": 2,
+            "socket_timeout": 30,
+        }
+        if cookies:
+            ydl_opts["cookiefile"] = cookies
 
-    try:
-        transcript = transcript_list.find_manually_created_transcript(preferred)
-    except Exception:
-        pass
-
-    if transcript is None and allow_auto:
+        url = f"https://www.youtube.com/watch?v={video_id}"
         try:
-            transcript = transcript_list.find_generated_transcript(preferred)
-        except Exception:
-            pass
-
-    if transcript is None:
-        try:
-            all_transcripts = list(transcript_list)
-            if all_transcripts:
-                transcript = all_transcripts[0]
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except yt_dlp.utils.DownloadError as e:
+            msg = str(e).lower()
+            if any(x in msg for x in ("429", "too many request", "sign in", "rate")):
+                return _RATE_LIMITED
+            return None
         except Exception:
             return None
 
-    if transcript is None:
-        return None
+        # Находим VTT-файлы; предпочитаем ручные (без .auto. в имени)
+        all_vtt = glob.glob(os.path.join(tmpdir, "*.vtt"))
+        if not all_vtt:
+            return None
 
-    try:
-        fetched = transcript.fetch()
-        return " ".join(
-            snip.text.strip()
-            for snip in fetched
-            if getattr(snip, "text", None)
-        )
-    except _RATE_LIMIT_ERRORS:
-        return _RATE_LIMITED
-    except Exception:
-        return None
+        # Приоритет: ручные субтитры > авто
+        manual = [f for f in all_vtt if ".auto." not in os.path.basename(f)]
+        # Из ручных — приоритет по языку
+        def lang_priority(f):
+            name = os.path.basename(f)
+            for i, l in enumerate(langs[:-1]):  # skip "all"
+                if f".{l}." in name:
+                    return i
+            return len(langs)
+
+        chosen_pool = manual if manual else all_vtt
+        chosen = sorted(chosen_pool, key=lang_priority)[0]
+
+        content = Path(chosen).read_text(encoding="utf-8", errors="replace")
+        text = _parse_vtt(content)
+        return text if text else None
 
 
 def sanitize_filename(name: str) -> str:
@@ -316,17 +342,28 @@ def main() -> None:
     batch_size = args.batch_size
     batch_pause = args.batch_pause
 
+    api_calls = 0  # считаем только реальные запросы к API (не уже существующие)
+
     with tqdm(total=total, desc="Транскрипты", unit="vid") as pbar:
         for i, video in enumerate(all_videos, start=1):
             global_index = offset + i
             video_id = video["id"]
             title = video["title"]
 
-            # Пауза между порциями
-            if i > 1 and (i - 1) % batch_size == 0:
-                batch_num = (i - 1) // batch_size
+            # Проверяем файл ДО любых запросов — экономим лимит API
+            if not args.overwrite:
+                expected_file = output_root / f"{global_index:03d} — {sanitize_filename(title)}.txt"
+                if expected_file.exists():
+                    tqdm.write(f"[skip] уже существует: {expected_file.name}")
+                    skipped_exists += 1
+                    pbar.update(1)
+                    continue
+
+            # Пауза между порциями — считаем только реальные API-запросы
+            if api_calls > 0 and api_calls % batch_size == 0:
+                batch_num = api_calls // batch_size
                 total_batches = (total + batch_size - 1) // batch_size
-                pause = batch_pause + random.uniform(-30, 30)
+                pause = batch_pause + random.uniform(0, min(30, batch_pause * 0.2))
                 tqdm.write(
                     f"\n[batch] Порция {batch_num}/{total_batches} завершена. "
                     f"Пауза {pause:.0f}с чтобы не словить бан..."
@@ -335,29 +372,39 @@ def main() -> None:
 
             time.sleep(_human_delay(args.delay, i))
 
-            result = None
-            for attempt in range(5):
-                result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
-                if result is _RATE_LIMITED:
-                    wait = 60 * (2 ** attempt)
-                    tqdm.write(f"[rate limit] Заблокированы. Ждём {wait}с (попытка {attempt+1}/5)...")
-                    time.sleep(wait)
-                    continue
-                break
+            api_calls += 1
+            result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
 
-            if result is _RATE_LIMITED or result is None:
-                reason = "rate limited after retries" if result is _RATE_LIMITED else "no transcript available"
+            if result is _RATE_LIMITED:
+                # Одна попытка восстановиться: короткий ретрай через 45 сек
+                tqdm.write(f"[rate limit] Заблокированы на видео {global_index}. Ждём 45с и пробуем ещё раз...")
+                time.sleep(45)
+                result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
+
+                if result is _RATE_LIMITED:
+                    # Всё равно заблокированы — делаем большую паузу и идём дальше
+                    # Не застреваем на одном видео на 30 минут
+                    extra_pause = batch_pause + random.uniform(30, 90)
+                    tqdm.write(f"[rate limit] Всё ещё заблокированы. Большая пауза {extra_pause:.0f}с, пропускаем видео.")
+                    log_skipped(output_root, video_id, title, "rate limited after retries")
+                    skipped_no_transcript += 1
+                    pbar.update(1)
+                    time.sleep(extra_pause)
+                    api_calls = 0  # сброс счётчика — следующий batch начнётся свежим
+                    continue
+
+            if result is None:
                 tqdm.write(f"[skip] нет транскрипта: {title}")
-                log_skipped(output_root, video_id, title, reason)
+                log_skipped(output_root, video_id, title, "no transcript available")
                 skipped_no_transcript += 1
                 pbar.update(1)
                 continue
 
             written = save_transcript(result, output_root, global_index, title, args.overwrite)
             if written:
+                tqdm.write(f"[ok] сохранено: {global_index:03d} — {sanitize_filename(title)}.txt")
                 saved += 1
             else:
-                tqdm.write(f"[skip] уже существует: {global_index:03d} — {sanitize_filename(title)}.txt")
                 skipped_exists += 1
             pbar.update(1)
 
