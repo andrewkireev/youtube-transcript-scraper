@@ -186,20 +186,20 @@ def tune(sessions: list[dict]) -> tuple[dict, str]:
 
         if clean_streak >= 4:
             # Уверенно ускоряемся
-            factor_delay  = 0.85
-            factor_batch  = 1.20
-            factor_pause  = 0.85
+            factor_delay  = 0.80
+            factor_batch  = 1.25
+            factor_pause  = 0.80
             lines.append("   4+ чистых подряд — ускоряемся заметно.")
         elif clean_streak >= 2:
-            factor_delay  = 0.92
-            factor_batch  = 1.10
-            factor_pause  = 0.92
+            factor_delay  = 0.88
+            factor_batch  = 1.15
+            factor_pause  = 0.88
             lines.append("   2+ чистых подряд — ускоряемся аккуратно.")
         else:
-            factor_delay  = 0.97
-            factor_batch  = 1.05
-            factor_pause  = 0.97
-            lines.append("   1 чистая сессия — минимальное ускорение.")
+            factor_delay  = 0.93
+            factor_batch  = 1.10
+            factor_pause  = 0.93
+            lines.append("   1 чистая сессия — ускоряемся умеренно.")
 
         delay       = delay       * factor_delay
         batch_size  = min(LIMITS["batch_size"][1],  int(math.ceil(batch_size * factor_batch)))
