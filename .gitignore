@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .env
 cookies.txt
+cookies_*.txt
 *.egg-info/
 dist/
 build/
+session_log.jsonl

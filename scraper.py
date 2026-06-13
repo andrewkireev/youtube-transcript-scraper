@@ -1,9 +1,11 @@
 import argparse
+import json
 import os
 import random
 import re
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +28,15 @@ except ImportError as e:
 
 
 _RATE_LIMITED = object()  # sentinel: отличаем rate limit от «нет субтитров»
+
+_SESSION_LOG = Path("session_log.jsonl")
+_TUNED_PARAMS = Path("tuned_params.json")
+
+
+def _log(event: dict) -> None:
+    """Дописывает JSON-событие в session_log.jsonl."""
+    with _SESSION_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def _normalize_channel_url(url: str) -> tuple[str, bool]:
@@ -305,6 +316,24 @@ def main() -> None:
     args = parser.parse_args()
     allow_auto = not args.no_auto
 
+    # Читаем параметры от тюнера (если есть и не переданы явно через CLI)
+    if _TUNED_PARAMS.exists():
+        try:
+            tuned = json.loads(_TUNED_PARAMS.read_text(encoding="utf-8"))
+            tp = tuned.get("params", {})
+            # Применяем только если пользователь не передал свои значения
+            # (argparse не даёт узнать это напрямую, используем значение по умолчанию как маркер)
+            if args.delay == 1.0 and "delay" in tp:
+                args.delay = tp["delay"]
+            if args.batch_size == 25 and "batch_size" in tp:
+                args.batch_size = int(tp["batch_size"])
+            if args.batch_pause == 600 and "batch_pause" in tp:
+                args.batch_pause = float(tp["batch_pause"])
+            print(f"[tuner] Параметры от тюнера: delay={args.delay}с | "
+                  f"batch_size={args.batch_size} | batch_pause={args.batch_pause}с")
+        except Exception:
+            pass
+
     # Подготовка cookies
     cookies_file = _resolve_cookies(args)
 
@@ -345,6 +374,15 @@ def main() -> None:
 
     api_calls = 0  # считаем только реальные запросы к API (не уже существующие)
 
+    # Логируем старт сессии для тюнера
+    session_id = str(uuid.uuid4())[:8]
+    _log({
+        "type": "session_start",
+        "session_id": session_id,
+        "ts": time.time(),
+        "params": {"delay": args.delay, "batch_size": args.batch_size, "batch_pause": args.batch_pause},
+    })
+
     # Первый размер порции — случайный от половины до полутора --batch-size
     _next_batch_at = random.randint(
         max(3, args.batch_size // 2),
@@ -381,9 +419,12 @@ def main() -> None:
             time.sleep(_human_delay(args.delay))
 
             api_calls += 1
+            call_ts = time.time()
             result = fetch_transcript(video_id, args.lang, allow_auto, cookies=cookies_file)
 
             if result is _RATE_LIMITED:
+                _log({"type": "api_call", "session_id": session_id, "ts": call_ts,
+                      "video_index": global_index, "result": "rate_limited"})
                 # Одна попытка восстановиться: случайная пауза 30–70 сек
                 retry_wait = random.uniform(30, 70)
                 tqdm.write(f"[rate limit] Заблокированы на видео {global_index}. Ждём {retry_wait:.0f}с...")
@@ -393,21 +434,25 @@ def main() -> None:
                 if result is _RATE_LIMITED:
                     # Всё равно заблокированы — случайная большая пауза и идём дальше
                     extra_pause = batch_pause * random.uniform(1.2, 2.0)
-                    tqdm.write(f"[rate limit] Всё ещё заблокированы. Большая пауза {extra_pause:.0f}с, пропускаем видео.")
+                    tqdm.write(f"[rate limit] Всё ещё заблокированы. Пауза {extra_pause:.0f}с, пропускаем.")
                     log_skipped(output_root, video_id, title, "rate limited after retries")
                     skipped_no_transcript += 1
                     pbar.update(1)
                     time.sleep(extra_pause)
-                    api_calls = 0  # сброс счётчика — следующий batch начнётся свежим
+                    api_calls = 0  # сброс — следующий batch начнётся свежим
                     continue
 
             if result is None:
+                _log({"type": "api_call", "session_id": session_id, "ts": call_ts,
+                      "video_index": global_index, "result": "no_transcript"})
                 tqdm.write(f"[skip] нет транскрипта: {title}")
                 log_skipped(output_root, video_id, title, "no transcript available")
                 skipped_no_transcript += 1
                 pbar.update(1)
                 continue
 
+            _log({"type": "api_call", "session_id": session_id, "ts": call_ts,
+                  "video_index": global_index, "result": "ok"})
             written = save_transcript(result, output_root, global_index, title, args.overwrite)
             if written:
                 tqdm.write(f"[ok] сохранено: {global_index:03d} — {sanitize_filename(title)}.txt")
@@ -416,8 +461,25 @@ def main() -> None:
                 skipped_exists += 1
             pbar.update(1)
 
-    print(f"\n[done] Сохранено: {saved} | Пропущено (нет субтитров): {skipped_no_transcript} | Уже было: {skipped_exists}")
+    # Логируем конец сессии
+    _log({
+        "type": "session_end",
+        "session_id": session_id,
+        "ts": time.time(),
+        "summary": {"saved": saved, "skipped_no_transcript": skipped_no_transcript,
+                    "skipped_exists": skipped_exists, "api_calls": api_calls},
+    })
+
+    print(f"\n[done] Сохранено: {saved} | Нет субтитров: {skipped_no_transcript} | Уже было: {skipped_exists}")
     print(f"[done] Файлы в: {output_root.resolve()}")
+
+    # Запускаем тюнер — он проанализирует сессию и обновит параметры
+    print("\n[tuner] Анализирую сессию и подстраиваю лимиты...")
+    try:
+        import tuner as _tuner
+        _tuner.run(verbose=True)
+    except Exception as e:
+        print(f"[tuner] Ошибка: {e}")
 
 
 if __name__ == "__main__":
